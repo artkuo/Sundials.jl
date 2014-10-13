@@ -334,8 +334,8 @@ function cvode(f::Function, y0::Vector{Float64}, t::Vector{Float64}; reltol::Flo
     return yres
 end
 
-multistepdict = ["BDF"=>CV_BDF, "ADAMS"=>CV_ADAMS]
-iterationdict = ["NEWTON"=>CV_NEWTON, "FUNCTIONAL"=>CV_FUNCTIONAL]
+multistepdict = Dict("BDF"=>CV_BDF, "ADAMS"=>CV_ADAMS)
+iterationdict = Dict("NEWTON"=>CV_NEWTON, "FUNCTIONAL"=>CV_FUNCTIONAL)
 
 function cvodej(f::Function, t::Vector{Float64}, y0::Vector{Float64};
   reltol::Float64=1e-4, abstol::Union(Vector{Float64},Float64)=1e-6, refine=4,
