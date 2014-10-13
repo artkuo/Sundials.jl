@@ -86,6 +86,8 @@ IDASetConstraints(mem, constraints::Vector{realtype}) =
     IDASetConstraints(mem, nvector(constraints))
 IDASolve(mem, tout, tret, yret::Vector{realtype}, ypret::Vector{realtype}, itask) =
     IDASolve(mem, tout, tret, nvector(yret), nvector(ypret), itask)
+IDAGetConsistentIC(mem, y::Vector{realtype}, yp::Vector{realtype}) =
+  IDAGetConsistentIC(mem, nvector(y), nvector(yp))
 
 # CVODE
 CVodeInit(mem, f::Function, t0, y0) =
@@ -102,6 +104,8 @@ CVodeGetEstLocalErrors(mem, ele::Vector{realtype}) =
     CVodeGetEstLocalErrors(mem, nvector(ele))
 CVodeRootInit(mem, nrtfn, g::Function) =
     CVodeRootInit(mem, nrtfn, cfunction(g, Int32, (realtype, N_Vector, Ptr{realtype}, Ptr{Void})))
+CVodeSetRootDir(mem, dir::Vector{Int32}) =
+    CVodeSetRootDir(mem, nvector(dir))
 CVDlsSetDenseJacFn(mem, jac::Function) =
     CVDlsSetDenseJacFn(mem, cfunction(jac, Int32, (Int32, realtype, N_Vector, N_Vector, DlsMat, Ptr{Void}, N_Vector, N_Vector, N_Vector)))
 CVode(mem, tout, yout::Vector{realtype}, tret, itask) =
@@ -251,20 +255,73 @@ function cvodefun(t::Float64, y::N_Vector, yp::N_Vector, userfun::Function)
     return int32(0)
 end
 
+function cvodejfun(t::Float64, y::N_Vector, yp::N_Vector, userdata::Array{Function,2})
+# wrap a julia right-hand side function to work with Sundials arrays
+# where the rhs function is embedded in the userdata passed by Sundials.
+# It should return a rhs like this: yprime = f(t, y)
+    y = Sundials.asarray(y)
+    yp = Sundials.asarray(yp)
+    rhsfun = userdata[1]   # userdata contains rhs function and optional event function
+    yprime = rhsfun(t, y)
+    for i = 1:length(yprime) # copy into yp, which is an N_Vector accessed like an array
+      yp[i] = yprime[i]
+    end
+    return int32(0)
+end
+
+function cvodeeventfun(t::Float64, y::N_Vector, g::Ptr{realtype}, userdata::Array{Function,2})
+# wrap a julia event function to work with Sundials arrays
+# expect the event function of the form output = events(t, y::Vector)
+# where we search for output to cross zero
+    y = Sundials.asarray(y)
+    usereventfun = userdata[2]
+    evntout = usereventfun(t, y)
+    if isa(evntout, Tuple)
+      evntout,isterminal,dir = evntout
+    end
+    g = Sundials.asarray(g,(length(evntout),))
+    for i = 1:length(evntout)
+      g[i] = evntout[i]
+    end
+    return int32(0)
+end
+
+type cvodesol
+  t::Vector
+  y::Array
+  solver::String
+  te::Vector
+  ye::Array
+  ie::Vector{Integer}
+end
+
 function cvode(f::Function, y0::Vector{Float64}, t::Vector{Float64}; reltol::Float64=1e-4, abstol::Float64=1e-6)
-    # f, Function to be optimized of the form f(y::Vector{Float64}, fy::Vector{Float64}, t::Float64)
-    #    where `y` is the input vector, and `fy` is the
-    # y0, Vector of initial values
-    # t, Vector of time values at which to record integration results
-    # reltol, Relative Tolerance to be used (default=1e-4)
-    # abstol, Absolute Tolerance to be used (default=1e-6)
-    # return: a solution matrix with time steps in `t` along rows and
-    #         state variable `y` along columns
-    neq = length(y0)
+# cvode(f, y0, t)
+# f, right-hand side function to be integrated of the form
+#   fy = f(t::Float64, y::Vector{Float64})
+#     where `t` is the time point, `y` is the input vector, and `fy` is the
+#     right-hand side (fy::Vector{Float64}).
+# y0, Vector of initial values
+# t, Vector of time values at which to record integration results
+# return: a solution matrix with time steps in `t` along rows and
+#         state variable `y` along columns
+#
+# Optional arguments:
+#  reltol, Relative Tolerance to be used (default=1e-4)
+#  abstol, Absolute Tolerance to be used (default=1e-6)
+    neq = length(y0) # number of eqns on right-hand side
+    # create memory block with linear multistep method _BDF or _ADAMS,
+    # specify solver iteration _NEWTON or _FUNCTIONAL
     mem = CVodeCreate(CV_BDF, CV_NEWTON)
+    # initialize solver with mem block, right-hand side function,
+    # starting time, and state vector
     flag = CVodeInit(mem, cfunction(cvodefun, Int32, (realtype, N_Vector, N_Vector, Function)), t[1], nvector(y0))
+    # attach user data block to CVode memory block
     flag = CVodeSetUserData(mem, f)
+    # set scalar relative and scalar absolute tolerances
+    # (alternatively CVodeSVtolerances for vector absolute tolerances)
     flag = CVodeSStolerances(mem, reltol, abstol)
+    # use dense internal solver with num of eqns, uses internal linear algebra
     flag = CVDense(mem, neq)
     yres = zeros(length(t), length(y0))
     yres[1,:] = y0
@@ -277,6 +334,112 @@ function cvode(f::Function, y0::Vector{Float64}, t::Vector{Float64}; reltol::Flo
     return yres
 end
 
+multistepdict = ["BDF"=>CV_BDF, "ADAMS"=>CV_ADAMS]
+iterationdict = ["NEWTON"=>CV_NEWTON, "FUNCTIONAL"=>CV_FUNCTIONAL]
+
+function cvodej(f::Function, t::Vector{Float64}, y0::Vector{Float64};
+  reltol::Float64=1e-4, abstol::Union(Vector{Float64},Float64)=1e-6, refine=4,
+  events::Union(Function,Nothing)=nothing, multistep="BDF", iteration="NEWTON")
+# cvode(f, y0, t)
+# f, right-hand side function to be integrated of the form
+#   fy = f(t::Float64, y::Vector{Float64})
+#     where `t` is the time point, `y` is the input vector, and `fy` is the
+#     right-hand side (fy::Vector{Float64}).
+# y0, Vector of initial values
+# t, Vector of time values at which to record integration results
+# return: a solution matrix with time steps in `t` along rows and
+#         state variable `y` along columns
+#
+# Optional arguments:
+#  reltol, Relative Tolerance to be used (default=1e-4)
+#  abstol, Absolute Tolerance to be used (default=1e-6)
+
+    neq = length(y0) # number of eqns on right-hand side
+    # create memory block with linear multistep method _BDF or _ADAMS,
+    # specify solver iteration _NEWTON or _FUNCTIONAL
+    mem = CVodeCreate(multistepdict[multistep], iterationdict[iteration])
+    # initialize solver with mem block, right-hand side function,
+    # starting time, and state vector. RHS
+    flag = CVodeInit(mem, cfunction(cvodejfun, Int32, (realtype, N_Vector, N_Vector, Array{Function,2})), t[1], nvector(y0))
+
+    # set scalar relative and scalar absolute tolerances
+    # (alternatively CVodeSVtolerances for vector absolute tolerances)
+    if isa(abstol, Number)
+      flag = CVodeSStolerances(mem, reltol, abstol)
+    else
+      flag = CVodeSVtolerances(mem, reltol, abstol)
+    end
+    # use dense internal solver with num of eqns, uses internal linear algebra
+    flag = CVDense(mem, neq)
+    te = zeros(0)
+    ye = zeros(0,neq)
+    ie = zeros(Integer,0)
+    if events !== nothing
+      # use one event call to find out number of events,
+      # and find out direction of zero-crossings, if any,
+      # and whether to terminate
+      eventoutput = events(t[1], y0)
+      isterminal = ()
+      rootdir = ()
+      if isa(eventoutput, Tuple) # might be more than one out
+          eventoutput, isterminal, rootdir = eventoutput
+      end
+      nevents = length(eventoutput) # we don
+      flag = CVodeRootInit(mem, int32(nevents),
+        cfunction(cvodeeventfun, Int32, (realtype, N_Vector, Ptr{realtype}, Array{Function,2})))
+      if length(rootdir) > 0
+        flag = CVodeSetRootDirection(mem, int32(rootdir))
+      end
+    end # if
+    # attach userdata block to CVode memory block, where userdata
+    # contains our right-hand side function and events (root) function
+    flag = CVodeSetUserData(mem, [f,events])
+    tout = [t[1]] # note that we put this scalar into a vector
+    # to make it easy to pass to CVode
+    if length(t) == 2 # only given a time span, so figure out steps
+      # based on optional parm refine (default 4)
+      t = linspace(t[1], t[2], ifloor(50*refine))
+    end
+    yres = zeros(length(t), length(y0)) # attempt to pre-allocate for results
+    yres[1,:] = y0
+    tres = zeros(length(t))
+    tres[1] = t[1]
+    y = copy(y0)
+    k = 2     # index into time steps
+    row = 2   # index into results array (differs from k with events)
+    while k <= length(t) || tout[1] < t[end]
+        flag = CVode(mem, t[min(k,length(t))], y, tout, CV_NORMAL)
+        if row <= size(yres,1) # store in results array
+          yres[row,:] = y
+          tres[row] = tout[1]
+        else                   # unless it's too small
+          yres = [yres, y']    # so append the latest result
+          push!(tres, tout[1])
+        end
+        if flag == CV_ROOT_RETURN
+          rootinfo = zeros(Int32,(nevents,))
+          CVodeGetRootInfo(mem, rootinfo)
+          eventindices = findin(rootinfo,[-1,1])
+          value, isterminal, direction = events(tout[1], y)
+          push!(te, tout[1])
+          push!(ie, eventindices[1])
+          ye = [ye, y']
+          if isterminal[eventindices[1]]
+            yres = yres[1:row,:]
+            tres = tres[1:row]
+            break
+          end
+        else # regular time step, so advance to next time
+          k += 1
+        end
+        row += 1
+        if size(yres,1) > 1000
+          break
+        end
+    end # while loop
+    return cvodesol(tres, yres, "cvodej", te,ye,ie)
+end
+
 @c Int32 IDASetUserData (Ptr{:None},Any) libsundials_ida  ## needed to allow passing a Function through the user data
 
 function idasolfun(t::Float64, y::N_Vector, yp::N_Vector, r::N_Vector, userfun::Function)
@@ -285,6 +448,27 @@ function idasolfun(t::Float64, y::N_Vector, yp::N_Vector, r::N_Vector, userfun::
     r = Sundials.asarray(r)
     userfun(t, y, yp, r)
     return int32(0)   # indicates normal return
+end
+
+function idajsolfun(t::Float64, y::N_Vector, yp::N_Vector, r::N_Vector, userdata::Function)
+# wrap a julia implicit function to work with Sundials arrays
+# where it is of the form f(t, y, yprime) = residual.
+    y = Sundials.asarray(y)
+    yp = Sundials.asarray(yp)
+    r = Sundials.asarray(r)
+    resfun = userdata   # userdata contains implicit function
+    residual = resfun(t, y, yp)
+    for i = 1:length(residual) # copy into r, which is an N_Vector accessed like an array
+      r[i] = residual[i]
+    end
+    return int32(0)
+end
+
+type idaodesol
+  t::Vector
+  y::Array
+  yprime::Array
+  solver::String
 end
 
 function idasol(f::Function, y0::Vector{Float64}, yp0::Vector{Float64}, t::Vector{Float64}; reltol::Float64=1e-4, abstol::Float64=1e-6)
@@ -322,5 +506,53 @@ function idasol(f::Function, y0::Vector{Float64}, yp0::Vector{Float64}, t::Vecto
     return yres, ypres
 end
 
+function idasolve(f::Function, y0::Vector{Float64}, yp0::Vector{Float64}, t::Vector{Float64}; reltol::Float64=1e-4, abstol::Float64=1e-6)
+    # f, Function to be optimized of the form f(y::Vector{Float64}, fy::Vector{Float64})
+    #    where `y` is the input vector, and `fy` is the
+    # y0, Vector of initial values
+    # yp0, Vector of initial values of the derivatives
+    # reltol, Relative Tolerance to be used (default=1e-4)
+    # abstol, Absolute Tolerance to be used (default=1e-6)
+    # return: (y,yp) two solution matrices representing the states and state derivatives
+    #         with time steps in `t` along rows and state variable `y` or `yp` along columns
+    neq = length(y0)
+    # create a memory block for idasolve
+    mem = IDACreate()
+    # initialize with info about the implicit function, initial time, y, and yprime
+    flag = IDAInit(mem, cfunction(idajsolfun, Int32, (realtype, N_Vector, N_Vector, N_Vector, Function)), t[1], nvector(y0), nvector(yp0))
+    # supply the implicit function in the userdata
+    flag = IDASetUserData(mem, f)
+    # set scalar tolerances reltol and abstol
+    flag = IDASStolerances(mem, reltol, abstol)
+    # attach dense solver and tell it the number of eqns
+    flag = IDADense(mem, neq)
+    # let's make sure our starting conditions satisfy a small residual
+    rtest = f(t[1], y0, yp0)
+    println("rtest $rtest")
+    if any(abs(rtest) .>= reltol) # violate tolerances
+        # then try to find better initial conditions
+        # where IDA_YA_YDP_INIT means figure out algebraic components of y and
+        # differential components of yp. time is given as a scale indicator.
+        flag = IDACalcIC(mem, Sundials.IDA_Y_INIT, t[2])
+        #ycorr = asarray()
+        #ypcorr = asarray()
+        println("before $y0 $yp0")
+        flag = IDAGetConsistentIC(mem, y0, yp0)
+        println("after $y0 $yp0")
+    end
+    yres = zeros(length(t), length(y0))
+    ypres = zeros(length(t), length(y0))
+    yres[1,:] = y0
+    ypres[1,:] = yp0
+    y = copy(y0)
+    yp = copy(yp0)
+    tout = [0.0]
+    for k in 2:length(t)
+        retval = Sundials.IDASolve(mem, t[k], tout, y, yp, IDA_NORMAL)
+        yres[k,:] = y
+        ypres[k,:] = yp
+    end
+    return idaodesol(t, yres, ypres, "idasolve")
+end
 
 end # module
